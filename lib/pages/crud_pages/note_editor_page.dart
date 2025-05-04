@@ -1,7 +1,8 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 import 'package:audio_waveforms/audio_waveforms.dart';
-import 'package:speech_to_text/speech_to_text.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import '../../database/models/note_model.dart';
 import '../../widgets/data/camera.dart';
 import '../../widgets/data/recorder.dart';
@@ -24,11 +25,11 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
   String? imagePath;
   String? audioPath;
-  String _transcribedText = '';
 
   late final String _noteId = widget.note?.id ?? const Uuid().v4();
   late final PlayerController _playerController = PlayerController();
-  final SpeechToText _speech = SpeechToText();
+
+  bool _isPlaying = false;
 
   bool get isEditing => widget.note != null;
 
@@ -37,24 +38,22 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     super.initState();
     if (isEditing) {
       _titleController.text = widget.note?.title ?? '';
-      _contentController.text = '';
-      _transcribedText = widget.note?.content ?? '';
+      _contentController.text = widget.note?.content ?? '';
       _loadMedia(_noteId);
     }
 
     _playerController.onCompletion.listen((_) {
-      if (mounted) setState(() {});
+      if (mounted) setState(() => _isPlaying = false);
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await _speech.initialize();
       if (!isEditing) {
         switch (widget.widgetType) {
           case 'image':
             await _openCamera();
             break;
           case 'recording':
-            await _startRecordingWithSTT();
+            await _openRecorder();
             break;
           case 'text':
           default:
@@ -62,19 +61,6 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
         }
       }
     });
-  }
-
-  Future<void> _startRecordingWithSTT() async {
-    _speech.listen(
-      onResult: (result) {
-        setState(() => _transcribedText = result.recognizedWords);
-      },
-      listenMode: ListenMode.dictation,
-      partialResults: true,
-      localeId: 'en_US',
-    );
-    await _openRecorder();
-    await _speech.stop();
   }
 
   @override
@@ -90,8 +76,14 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
     final note = Note(
       id: _noteId,
-      title: _titleController.text.trim().isEmpty ? null : _titleController.text.trim(),
-      content: _transcribedText.trim().isEmpty ? null : _transcribedText.trim(),
+      title:
+          _titleController.text.trim().isEmpty
+              ? null
+              : _titleController.text.trim(),
+      content:
+          _contentController.text.trim().isEmpty
+              ? null
+              : _contentController.text.trim(),
       label: null,
       userId: null,
       firebaseId: null,
@@ -103,22 +95,26 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
 
     final media = <Media>[];
     if (imagePath != null) {
-      media.add(Media(
-        id: const Uuid().v4(),
-        parentId: _noteId,
-        parentType: 'note',
-        filePath: imagePath!,
-        mediaType: 'image',
-      ));
+      media.add(
+        Media(
+          id: const Uuid().v4(),
+          parentId: _noteId,
+          parentType: 'note',
+          filePath: imagePath!,
+          mediaType: 'image',
+        ),
+      );
     }
     if (audioPath != null) {
-      media.add(Media(
-        id: const Uuid().v4(),
-        parentId: _noteId,
-        parentType: 'note',
-        filePath: audioPath!,
-        mediaType: 'recording',
-      ));
+      media.add(
+        Media(
+          id: const Uuid().v4(),
+          parentId: _noteId,
+          parentType: 'note',
+          filePath: audioPath!,
+          mediaType: 'recording',
+        ),
+      );
     }
 
     if (media.isNotEmpty) {
@@ -137,10 +133,11 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     final path = await Navigator.push<String>(
       context,
       MaterialPageRoute(
-        builder: (_) => CameraCaptureWidget(
-          onImageCaptured: (path) => Navigator.pop(context, path),
-          onCancel: () => Navigator.pop(context),
-        ),
+        builder:
+            (_) => CameraCaptureWidget(
+              onImageCaptured: (path) => Navigator.pop(context, path),
+              onCancel: () => Navigator.pop(context),
+            ),
       ),
     );
     if (path != null && mounted) {
@@ -152,10 +149,11 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
     final path = await Navigator.push<String>(
       context,
       MaterialPageRoute(
-        builder: (_) => AudioRecorderWidget(
-          onRecordingComplete: (path) => Navigator.pop(context, path),
-          onCancel: () => Navigator.pop(context),
-        ),
+        builder:
+            (_) => AudioRecorderWidget(
+              onRecordingComplete: (path) => Navigator.pop(context, path),
+              onCancel: () => Navigator.pop(context),
+            ),
       ),
     );
     if (path != null && mounted) {
@@ -173,6 +171,51 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
       }
     }
     if (mounted) setState(() {});
+  }
+
+  Future<bool> _confirmDelete(String mediaType) async {
+    return await showDialog<bool>(
+          context: context,
+          builder:
+              (_) => AlertDialog(
+                title: Text("Delete $mediaType?"),
+                content: Text(
+                  "This will remove the $mediaType from this note.",
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text("Cancel"),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text("Delete"),
+                  ),
+                ],
+              ),
+        ) ??
+        false;
+  }
+
+  Future<String?> _runOCR(File imageFile) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final inputImage = InputImage.fromFile(imageFile);
+    final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+
+    final result = await recognizer.processImage(inputImage);
+    await recognizer.close();
+
+    final text = result.text.trim();
+    if (text.isEmpty) {
+      if (mounted && messenger != null) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('No text found in image')),
+        );
+      }
+      return null;
+    }
+
+    return text;
   }
 
   @override
@@ -203,12 +246,17 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                 contentController: _contentController,
                 readOnly: false,
               ),
-              if (_transcribedText.trim().isNotEmpty)
+              if (widget.note?.content?.trim().isNotEmpty == true)
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16.0,
+                    vertical: 12.0,
+                  ),
                   child: Card(
                     color: Colors.grey.shade100,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
                     child: Padding(
                       padding: const EdgeInsets.all(12.0),
                       child: Column(
@@ -216,29 +264,193 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                         children: [
                           const Text(
                             "Extracted Content (read-only)",
-                            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
                           ),
                           const SizedBox(height: 8),
                           SelectableText(
-                            _transcribedText,
+                            widget.note!.content!,
                             style: const TextStyle(fontStyle: FontStyle.italic),
-                          ),
-                          const SizedBox(height: 8),
-                          Align(
-                            alignment: Alignment.centerRight,
-                            child: TextButton(
-                              onPressed: () {
-                                _contentController.text += '\n$_transcribedText';
-                              },
-                              child: const Text("Copy to Note"),
-                            ),
                           ),
                         ],
                       ),
                     ),
                   ),
                 ),
+
+              if (imagePath != null)
+                Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: GestureDetector(
+                    onLongPress: () async {
+                      final choice = await showModalBottomSheet<String>(
+                        context: context,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        builder:
+                            (_) => Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                ListTile(
+                                  leading: const Icon(Icons.text_snippet),
+                                  title: const Text('Extract text (OCR)'),
+                                  onTap: () => Navigator.pop(context, 'ocr'),
+                                ),
+                                ListTile(
+                                  leading: const Icon(Icons.delete),
+                                  title: const Text('Delete image'),
+                                  onTap: () => Navigator.pop(context, 'delete'),
+                                ),
+                              ],
+                            ),
+                      );
+
+                      if (choice == 'ocr') {
+                        final text = await _runOCR(File(imagePath!));
+                        if (text != null && mounted) {
+                          _contentController.text += "\n$text";
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                "Extracted text: ${text.length > 40 ? '${text.substring(0, 40)}...' : text}",
+                              ),
+                            ),
+                          );
+                        }
+                      } else if (choice == 'delete') {
+                        final confirm = await _confirmDelete('image');
+                        if (confirm && mounted) {
+                          final file = File(imagePath!);
+                          if (await file.exists()) await file.delete();
+                          setState(() => imagePath = null);
+                        }
+                      }
+                    },
+                    child: SizedBox(
+                      width: double.infinity,
+                      height: 160,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(12),
+                        child: Image.file(File(imagePath!), fit: BoxFit.cover),
+                      ),
+                    ),
+                  ),
+                ),
+              if (audioPath != null)
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16.0,
+                    vertical: 8,
+                  ),
+                  child: GestureDetector(
+                    onLongPress: () async {
+                      final choice = await showModalBottomSheet<String>(
+                        context: context,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        builder:
+                            (_) => Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                ListTile(
+                                  leading: const Icon(Icons.surround_sound),
+                                  title: const Text(
+                                    'Transcribe audio (coming soon)',
+                                  ),
+                                  onTap:
+                                      () =>
+                                          Navigator.pop(context, 'transcribe'),
+                                ),
+                                ListTile(
+                                  leading: const Icon(Icons.delete),
+                                  title: const Text('Delete recording'),
+                                  onTap: () => Navigator.pop(context, 'delete'),
+                                ),
+                              ],
+                            ),
+                      );
+
+                      if (choice == 'transcribe') {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              "Audio transcription not available offline yet.",
+                            ),
+                            duration: Duration(seconds: 2),
+                          ),
+                        );
+                      } else if (choice == 'delete') {
+                        final shouldDelete = await _confirmDelete('recording');
+                        if (shouldDelete && mounted) {
+                          final file = File(audioPath!);
+                          if (await file.exists()) await file.delete();
+                          await _playerController.stopPlayer();
+                          setState(() {
+                            audioPath = null;
+                            _isPlaying = false;
+                          });
+                        }
+                      }
+                    },
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            IconButton(
+                              icon: Icon(
+                                _isPlaying ? Icons.stop : Icons.play_arrow,
+                              ),
+                              onPressed: () async {
+                                if (_isPlaying) {
+                                  await _playerController.stopPlayer();
+                                } else {
+                                  await _playerController.preparePlayer(
+                                    path: audioPath!,
+                                  );
+                                  await _playerController.startPlayer();
+                                }
+                                if (mounted) {
+                                  setState(() => _isPlaying = !_isPlaying);
+                                }
+                              },
+                            ),
+                            const Text("Tap to play audio"),
+                          ],
+                        ),
+                        AudioFileWaveforms(
+                          size: const Size(double.infinity, 50),
+                          playerController: _playerController,
+                          enableSeekGesture: true,
+                          waveformType: WaveformType.long,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
             ],
+          ),
+        ),
+        bottomNavigationBar: BottomAppBar(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24.0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.camera_alt),
+                  onPressed: _openCamera,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.mic),
+                  onPressed: _openRecorder,
+                ),
+              ],
+            ),
           ),
         ),
       ),

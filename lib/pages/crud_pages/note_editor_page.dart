@@ -7,7 +7,8 @@ import '../../database/models/note_model.dart';
 import '../../widgets/data/camera.dart';
 import '../../widgets/data/recorder.dart';
 import '../../widgets/data/text_input.dart';
-import '../../database/operations/note_operations.dart';
+import '../../database/operations/note_operations.dart'; 
+import '../../ai/speech_to_text_helper.dart';
 
 class NoteEditorPage extends StatefulWidget {
   final Note? note;
@@ -375,14 +376,65 @@ class _NoteEditorPageState extends State<NoteEditorPage> {
                       );
 
                       if (choice == 'transcribe') {
-                        ScaffoldMessenger.of(context).showSnackBar(
+                        final messenger = ScaffoldMessenger.of(context);
+                        messenger.showSnackBar(
                           const SnackBar(
-                            content: Text(
-                              "Audio transcription not available offline yet.",
-                            ),
-                            duration: Duration(seconds: 2),
+                            content: Text("Initializing speech recognizer..."),
                           ),
                         );
+
+                        final initialized = await SpeechToTextHelper.initialize(
+                          onError: (err) {
+                            messenger.showSnackBar(
+                              SnackBar(content: Text("Error: $err")),
+                            );
+                          },
+                        );
+
+                        if (!initialized) return;
+
+                        messenger.showSnackBar(
+                          const SnackBar(
+                            content: Text("Transcribing... Please wait."),
+                          ),
+                        );
+
+                        await SpeechToTextHelper.startTranscription(
+                          onUpdate: (text) {
+                            if (mounted) {
+                              setState(() {
+                                _contentController.text += "\n🎤 $text";
+                              });
+                            }
+                          },
+                          listenFor: const Duration(seconds: 12),
+                          pauseFor: const Duration(seconds: 3),
+                        );
+
+                        await Future.delayed(const Duration(seconds: 13));
+                        await SpeechToTextHelper.stopTranscription();
+
+                        final result =
+                            SpeechToTextHelper.getTranscriptionResult();
+
+                        if (result.isNotEmpty && mounted) {
+                          setState(() {
+                            _contentController.text += "\n🎤 $result";
+                          });
+                          messenger.showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                "Transcribed: ${result.length > 40 ? '${result.substring(0, 40)}...' : result}",
+                              ),
+                            ),
+                          );
+                        } else {
+                          messenger.showSnackBar(
+                            const SnackBar(
+                              content: Text("No speech recognized."),
+                            ),
+                          );
+                        }
                       } else if (choice == 'delete') {
                         final shouldDelete = await _confirmDelete('recording');
                         if (shouldDelete && mounted) {
